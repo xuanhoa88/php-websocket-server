@@ -67,4 +67,4 @@ This is the amount of seconds a client has to send any data to the server, befor
 
 *WS_IDLE_LIMIT_PONG*
 
-This works with _WS_IDLE_LIMIT_READ_, and is the amount of seconds a client has to respond to the ping request before the serer closes the client connection.
+This works with _WS_IDLE_LIMIT_READ_, and is the amount of seconds a client has to respond to the ping request before the server closes the client connection.
