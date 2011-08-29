@@ -6,7 +6,7 @@ wsStartServer(string Host, integer Port)
 
 wsStopServer()
 
-wsSend(resource Socket, string Message, [[ boolean Binary = false ] )
+wsSend(resource Socket, string Message, { boolean Binary = false } )
 
 wsClose(resource Socket)
 
