@@ -2,27 +2,23 @@
 
 ==Functions==
 
-wsStartServer(string Host, integer Port)
-
-wsStopServer()
-
-wsSend(resource Socket, string Message, `[` boolean Binary = false `]`)
-
+wsStartServer(string Host, integer Port)<br>
+wsStopServer()<br>
+wsSend(resource Socket, string Message, `[` boolean Binary = false `]`)<br>
 wsClose(resource Socket)
 
 ==Callbacks==
 
-wsOnOpen(resource Socket)
-
-wsOnMessage(resource Socket, string Message, boolean Binary)
-
+wsOnOpen(resource Socket)<br>
+wsOnMessage(resource Socket, string Message, boolean Binary)<br>
 wsOnClose(resource Socket, integer/false Status)
 
 ==Function Details==
 
 *wsStartServer(string Host, integer Port)*
 
-This starts the server, which listens for incoming connections.
+This starts the server, which waits for clients to connect.<br>
+This is the core function that runs the server, this function does not return until the server stops.
 
 *wsStopServer()*
 
