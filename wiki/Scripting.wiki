@@ -6,7 +6,7 @@ wsStartServer(string Host, integer Port)
 
 wsStopServer()
 
-wsSend(resource Socket, string Message, { boolean Binary = false } )
+wsSend(resource Socket, string Message, `[` boolean Binary = false `]`)
 
 wsClose(resource Socket)
 
@@ -28,7 +28,7 @@ This starts the server, which listens for incoming connections.
 
 This stops the server, and informs all clients that the server is shutting down.  This will cause *wsStartServer* to return true.
 
-*wsSend(resource Socket, string Message, { boolean Binary = false })*
+*wsSend(resource Socket, string Message, `[` boolean Binary = false `]`)*
 
 This sends a message to a client. If the optional _Binary_ parameter is true, the message type is set to binary.
 
