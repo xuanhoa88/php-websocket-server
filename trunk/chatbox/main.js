@@ -1,7 +1,7 @@
 cb = {
 	// settings
 	serverHost: window.location.host, // automatically retrieved from the URL
-	serverPort: 9432,
+	serverPort: 9300,
 	usernameMaxLength: 18,
 	
 	// internal variables
