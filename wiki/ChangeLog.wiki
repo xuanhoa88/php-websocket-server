@@ -7,7 +7,7 @@
 Changed all "resource Socket" parameters to "integer ClientID".<br>
 This improves performance and makes it much easier to code with, eg. storing clients in arrays.
 
-Changed all occurrences of $wsListen to $wsRead[0].
+Changed all occurrences of $wsListen to $wsRead`[`0`]`.
 
 Changed sizeof($wsRead)-1 to global variable $wsClientCount to hold the amount of clients connected.
 
