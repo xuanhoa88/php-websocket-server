@@ -1,47 +1,42 @@
 <?php
 
 /*
-	PHP WebSockets Server - Currently works with Firefox 6 (24/08/2011)
+	PHP WebSocket Server 0.2
+	 - http://code.google.com/p/php-websocket-server/
+	 - http://code.google.com/p/php-websocket-server/wiki/Scripting
 	
-	Script Version 0.1
-	http://code.google.com/p/php-websocket-server/
+	WebSocket Protocol 07
+	 - http://tools.ietf.org/html/draft-ietf-hybi-thewebsocketprotocol-07
+	 - Supported by Firefox 6 (30/08/2011)
 	
-	WebSockets Version 07
-	http://tools.ietf.org/html/draft-ietf-hybi-thewebsocketprotocol-07
-	
-	Please note that the current version of this script is in Beta mode, using this script for a company is not recommended.
 	Whilst a big effort is made to follow the protocol documentation, the current script version may unknowingly differ.
 	Please report any bugs you may find, all feedback and questions are welcome!
-	
-	
-	[ Functions ]
-		wsStartServer(host, port)                     -- returns true on success, or false if the server is already running
-		wsStopServer()                                -- returns true on success, or false is the server is not running
-		
-		wsSend(socket, message, [ binary = false ] )  -- returns true on success, or false on failure
-		wsClose(socket)                               -- returns true on success, or false if the socket was not internally stored
-	
-	[ Callbacks ]
-		wsOnOpen(socket)                              -- called after a valid client handshake is completed
-		wsOnMessage(socket, message, binary)          -- called when a message is received from the client. binary will be false is the message type is text, otherwise true if binary
-		wsOnClose(socket, status)                     -- called when the closing handshake is completed, or the client closes the TCP connection
-		                                                 only called for clients where the handshake is completed
-		                                                 if the client triggered the close, and didn't specify a reason status code, status will be false
-		                                                 if the client timed out (detected by the server), status will be WS_CLOSE_STATUS_TIMEOUT (not defined in WebSockets 7 protocol)
-	
-	[ Parameter Data Types ]
-		resource socket
-		string   message
-		bool     binary
-		int/bool status
-		string   host
-		int      port
 */
 
+
 // settings
-define('WS_MAX_CLIENTS',     100);
-define('WS_IDLE_LIMIT_READ', 10); // seconds a client has to send data to the server, before the server sends it a ping request
-define('WS_IDLE_LIMIT_PONG', 5);  // seconds a client has to reply to the ping request, before the connection is closed, and wsOnClose() is called with status WS_CLOSE_STATUS_TIMEOUT
+
+// maximum amount of clients that can be connected at one time
+define('WS_MAX_CLIENTS', 100);
+
+// maximum amount of clients that can be connected at one time on the same IP v4 address
+define('WS_MAX_CLIENTS_PER_IP', 15);
+
+// amount of seconds a client has to send data to the server, before a ping request is sent to the client,
+// if the client has not completed the opening handshake, the ping request is skipped and the client connection is closed
+define('WS_TIMEOUT_RECV', 10);
+
+// amount of seconds a client has to reply to a ping request, before the client connection is closed
+define('WS_TIMEOUT_PONG', 5);
+
+// the maximum length, in bytes, of a frame's payload data (a message consists of 1 or more frames), this is also internally limited to 2,147,479,538
+define('WS_MAX_FRAME_PAYLOAD_RECV', 100000);
+
+// the maximum length, in bytes, of a message's payload data, this is also internally limited to 2,147,483,647
+define('WS_MAX_MESSAGE_PAYLOAD_RECV', 500000);
+
+
+
 
 // internal
 define('WS_FIN',  128);
@@ -68,89 +63,110 @@ define('WS_STATUS_PROTOCOL_ERROR',           1002);
 define('WS_STATUS_UNSUPPORTED_MESSAGE_TYPE', 1003);
 define('WS_STATUS_MESSAGE_TOO_BIG',          1004);
 
-define('WS_CLOSE_STATUS_TIMEOUT', 1);
+define('WS_STATUS_TIMEOUT', 3000);
 
 // global vars
-$wsClients = array();
-$wsRead    = array();
-$wsListen  = false;
+$wsClients       = array();
+$wsRead          = array();
+$wsClientCount   = 0;
+$wsClientIPCount = array();
 
 /*
-	$wsClients[ i ] = array(
-		0 => resource socket,               // client socket
-		1 => string   readBuffer,           // a blank string when there's no incoming frames
-		2 => integer  readyState,           // between 0 and 3
-		3 => integer  lastRecvTime,         // initially set to 0
-		4 => bool/int pingSentTime,         // false when the server is not waiting for a pong
-		5 => bool/int closeStatus           // the close status that wsOnClose() will be called with
+	$wsClients[ integer ClientID ] = array(
+		0 => resource  Socket,                            // client socket
+		1 => string    MessageBuffer,                     // a blank string when there's no incoming frames
+		2 => integer   ReadyState,                        // between 0 and 3
+		3 => integer   LastRecvTime,                      // set to time() when the client is added
+		4 => int/false PingSentTime,                      // false when the server is not waiting for a pong
+		5 => int/false CloseStatus,                       // close status that wsOnClose() will be called with
+		6 => integer   IPv4,                              // client's IP stored as a signed long, retrieved from ip2long()
+		7 => int/false FramePayloadDataLength,            // length of a frame's payload data, reset to false when all frame data has been read (cannot reset to 0, to allow reading of mask key)
+		8 => integer   FrameBytesRead,                    // amount of bytes read for a frame, reset to 0 when all frame data has been read
+		9 => string    FrameBuffer,                       // joined onto end as a frame's data comes in, reset to blank string when all frame data has been read
+		10 => integer  MessageOpcode,                     // stored by the first frame for fragmented messages, default value is 0
+		11 => integer  MessageBufferLength                // the payload data length of MessageBuffer
 	)
 	
-	$wsRead[ int ] = resource socket        // int (not i), so there can be gaps, eg. 0, 1, 2, 5, 6 (skip 3 and 4)
+	$wsRead[ integer ClientID ] = resource Socket         // this one-dimensional array is used for socket_select()
+	                                                      // $wsRead[ 0 ] is the socket listening for incoming client connections
 	
-	$wsListen = resource socket             // the socket listening for client connections
+	$wsClientCount = integer ClientCount                  // amount of clients currently connected
+	
+	$wsClientIPCount[ integer IP ] = integer ClientCount  // amount of clients connected per IP v4 address
 */
 
 // server state functions
 function wsStartServer($host, $port) {
-	global $wsListen, $wsRead;
-	if ($wsListen) return false;
+	global $wsRead, $wsClientCount, $wsClientIPCount;
+	if (isset($wsRead[0])) return false;
 	
-	if (!$wsListen = socket_create(AF_INET, SOCK_STREAM, SOL_TCP))  return false;
-	if (!socket_set_option($wsListen, SOL_SOCKET, SO_REUSEADDR, 1)) return false;
-	if (!socket_bind($wsListen, $host, $port))                      return false;
-	if (!socket_listen($wsListen, 10))                              return false;
+	if (!$wsRead[0] = socket_create(AF_INET, SOCK_STREAM, SOL_TCP)) {
+		return false;
+	}
+	if (!socket_set_option($wsRead[0], SOL_SOCKET, SO_REUSEADDR, 1)) {
+		socket_close($wsRead[0]);
+		return false;
+	}
+	if (!socket_bind($wsRead[0], $host, $port)) {
+		socket_close($wsRead[0]);
+		return false;
+	}
+	if (!socket_listen($wsRead[0], 10)) {
+		socket_close($wsRead[0]);
+		return false;
+	}
 	
-	$wsRead[] = $wsListen;
 	$write = array();
 	$except = array();
 	
-	$buffer = '';
 	$nextPingCheck = time() + 1;
-	while ($wsListen) {
+	while (isset($wsRead[0])) {
 		$changed = $wsRead;
 		$result = socket_select($changed, $write, $except, 1);
 		
 		if ($result === false) {
-			socket_close($wsListen);
+			socket_close($wsRead[0]);
 			return false;
 		}
 		elseif ($result > 0) {
-			$remove = array();
-			
-			foreach ($changed as $socket) {
-				if ($socket != $wsListen) {
+			foreach ($changed as $clientID => $socket) {
+				if ($clientID != 0) {
 					// client socket changed
+					$buffer = '';
 					$bytes = @socket_recv($socket, $buffer, 4096, 0);
 					
 					if ($bytes === false) {
 						// error on recv, remove client socket (will check to send close frame)
-						$remove[] = $socket;
+						wsSendClientClose($clientID, WS_STATUS_PROTOCOL_ERROR);
 					}
 					elseif ($bytes > 0) {
 						// process handshake or frame(s)
-						if (!wsProcessClient($socket, $buffer)) $remove[] = $socket;
+						if (!wsProcessClient($clientID, $buffer, $bytes)) {
+							wsSendClientClose($clientID, WS_STATUS_PROTOCOL_ERROR);
+						}
 					}
 					else {
-						// 0 bytes recv'd from socket (client closed TCP connection)
-						// no point in sending close frame back to client, coz TCP is closed
-						wsRemoveClient($socket);
+						// 0 bytes received from client, meaning the client closed the TCP connection
+						wsRemoveClient($clientID);
 					}
 				}
 				else {
 					// listen socket changed
-					if (sizeof($wsRead)-1 < WS_MAX_CLIENTS) {
-						$client = socket_accept($wsListen);
+					$client = socket_accept($wsRead[0]);
+					if ($client !== false) {
+						// fetch client IP as integer
+						$clientIP = '';
+						$result = socket_getpeername($client, $clientIP);
+						$clientIP = ip2long($clientIP);
 						
-						if ($client !== false) {
-							wsAddClient($client);
+						if ($result !== false && $wsClientCount < WS_MAX_CLIENTS && (!isset($wsClientIPCount[$clientIP]) || $wsClientIPCount[$clientIP] < WS_MAX_CLIENTS_PER_IP)) {
+							wsAddClient($client, $clientIP);
+						}
+						else {
+							socket_close($client);
 						}
 					}
 				}
-			}
-			
-			// remove the marked sockets
-			foreach ($remove as $socket) {
-				wsSendClientClose($socket, WS_STATUS_PROTOCOL_ERROR);
 			}
 		}
 		
@@ -163,16 +179,28 @@ function wsStartServer($host, $port) {
 	return true; // returned when wsStopServer() is called
 }
 function wsStopServer() {
-	global $wsClients, $wsRead, $wsListen;
-	if (!$wsListen) return false;
+	global $wsClients, $wsRead, $wsClientCount, $wsClientIPCount;
 	
-	foreach ($wsClients as $client) {
-		wsSendClientClose($client[0], WS_STATUS_GONE_AWAY);
+	// check if server is not running
+	if (!isset($wsRead[0])) return false;
+	
+	// close all client connections
+	foreach ($wsClients as $clientID => $client) {
+		// if the client's opening handshake is complete, tell the client the server is 'going away'
+		if ($client[2] != WS_READY_STATE_CONNECTING) {
+			wsSendClientClose($clientID, WS_STATUS_GONE_AWAY);
+		}
+		socket_close($client[0]);
 	}
-	socket_close($wsListen);
 	
-	$wsRead = array();
-	$wsListen = false;
+	// close the socket which listens for incoming clients
+	socket_close($wsRead[0]);
+	
+	// reset variables
+	$wsRead          = array();
+	$wsClients       = array();
+	$wsClientCount   = 0;
+	$wsClientIPCount = array();
 	
 	return true;
 }
@@ -182,73 +210,391 @@ function wsCheckIdleClients() {
 	global $wsClients;
 	
 	$time = time();
-	foreach ($wsClients as $key => $client) {
-		if ($client[2] == WS_READY_STATE_OPEN) { // handshake completed, and ready state not closing or closed
-			if ($client[4] !== false) { // ping request has already been sent to client, pending a pong reply
-				if ($time >= $client[4] + WS_IDLE_LIMIT_PONG) { // client didn't respond to the server's ping request in WS_IDLE_LIMIT_PONG seconds
-					wsSendClientClose($client[0], WS_CLOSE_STATUS_TIMEOUT);
-					wsRemoveClient($client[0]);
+	foreach ($wsClients as $clientID => $client) {
+		if ($client[2] != WS_READY_STATE_CLOSED) {
+			// client ready state is not closed
+			if ($client[4] !== false) {
+				// ping request has already been sent to client, pending a pong reply
+				if ($time >= $client[4] + WS_TIMEOUT_PONG) {
+					// client didn't respond to the server's ping request in WS_TIMEOUT_PONG seconds
+					wsSendClientClose($clientID, WS_STATUS_TIMEOUT);
+					wsRemoveClient($clientID);
 				}
 			}
-			elseif ($time >= $client[3] + WS_IDLE_LIMIT_READ) { // last data was received >= WS_IDLE_LIMIT_READ seconds ago
-				$wsClients[$key][4] = time();
-				wsSendClientMessage($client[0], WS_OPCODE_PING, '');
+			elseif ($time >= $client[3] + WS_TIMEOUT_RECV) {
+				// last data was received >= WS_TIMEOUT_RECV seconds ago
+				if ($client[2] != WS_READY_STATE_CONNECTING) {
+					// client ready state is open or closing
+					$wsClients[$clientID][4] = time();
+					wsSendClientMessage($clientID, WS_OPCODE_PING, '');
+				}
+				else {
+					// client ready state is connecting
+					wsRemoveClient($clientID);
+				}
 			}
 		}
 	}
 }
 
-// client state functions
-function wsGetClientArrayKey($socket) {
-	global $wsClients;
-	foreach ($wsClients as $key => $client) {
-		if ($client[0] == $socket) return $key;
+// client existence functions
+function wsAddClient($socket, $clientIP) {
+	global $wsClients, $wsRead, $wsClientCount, $wsClientIPCount;
+	
+	// increase amount of clients connected
+	$wsClientCount++;
+	
+	// increase amount of clients connected on this client's IP
+	if (isset($wsClientIPCount[$clientIP])) {
+		$wsClientIPCount[$clientIP]++;
 	}
-	return false;
+	else {
+		$wsClientIPCount[$clientIP] = 1;
+	}
+	
+	// fetch next client ID
+	$clientID = wsGetNextClientID();
+	
+	// store initial client data
+	$wsClients[$clientID] = array($socket, '', WS_READY_STATE_CONNECTING, time(), false, 0, $clientIP, false, 0, '', 0, 0);
+	
+	// store socket - used for socket_select()
+	$wsRead[$clientID] = $socket;
 }
-function wsAddClient($socket) {
-	global $wsClients, $wsRead;
-	$wsClients[] = array($socket, '', WS_READY_STATE_CONNECTING, 0, false, 0);
-	$wsRead[] = $socket;
-}
-function wsRemoveClient($socket) {
-	global $wsClients, $wsRead;
+function wsRemoveClient($clientID) {
+	global $wsClients, $wsRead, $wsClientCount, $wsClientIPCount;
 	
-	$key = wsGetClientArrayKey($socket);
+	// fetch close status (which could be false), and call wsOnClose
+	$closeStatus = $wsClients[$clientID][5];
+	if (function_exists('wsOnClose')) wsOnClose($clientID, $closeStatus);
 	
-	$status = $wsClients[$key][5];
-	if (function_exists('wsOnClose')) wsOnClose($socket, $status);
-	
+	// close socket
+	$socket = $wsClients[$clientID][0];
 	socket_close($socket);
 	
-	array_splice($wsRead, array_search($socket, $wsRead), 1);
-	array_splice($wsClients, $key, 1);
+	// decrease amount of clients connected on this client's IP
+	$clientIP = $wsClients[$clientID][6];
+	if ($wsClientIPCount[$clientIP] > 1) {
+		$wsClientIPCount[$clientIP]--;
+	}
+	else {
+		unset($wsClientIPCount[$clientIP]);
+	}
 	
-	return true;
+	// decrease amount of clients connected
+	$wsClientCount--;
+	
+	// remove socket and client data from arrays
+	unset($wsRead[$clientID], $wsClients[$clientID]);
+}
+
+// client data functions
+function wsGetNextClientID() {
+	global $wsRead;
+	$i = 1; // starts at 1 because 0 is the listen socket
+	while (isset($wsRead[$i])) $i++;
+	return $i;
+}
+function wsGetClientSocket($clientID) {
+	global $wsClients;
+	return $wsClients[$clientID][0];
 }
 
 // client read functions
-function wsProcessClient($socket, &$buffer) {
+function wsProcessClient($clientID, &$buffer, $bufferLength) {
 	global $wsClients;
 	
-	$key = wsGetClientArrayKey($socket);
-	if ($wsClients[$key][2] == WS_READY_STATE_OPEN || $wsClients[$key][2] == WS_READY_STATE_CLOSING) { // handshake completed, and ready state not closed
-		$result = wsProcessClientMessage($key, $buffer);
+	if ($wsClients[$clientID][2] == WS_READY_STATE_OPEN) {
+		// handshake completed
+		$result = wsBuildClientFrame($clientID, $buffer, $bufferLength);
 	}
-	elseif ($wsClients[$key][2] == WS_READY_STATE_CONNECTING) { // handshake not completed
-		$result = wsProcessClientHandshake($socket, $buffer);
+	elseif ($wsClients[$clientID][2] == WS_READY_STATE_CONNECTING) {
+		// handshake not completed
+		$result = wsProcessClientHandshake($clientID, $buffer);
 		if ($result) {
-			$wsClients[$key][2] = WS_READY_STATE_OPEN;
-			if (function_exists('wsOnOpen')) wsOnOpen($socket);
+			$wsClients[$clientID][2] = WS_READY_STATE_OPEN;
+			if (function_exists('wsOnOpen')) wsOnOpen($clientID);
 		}
 	}
 	else {
-		$result = false; // ready state is set to closed
+		// ready state is set to closed
+		$result = false;
 	}
 	
 	return $result;
 }
-function wsProcessClientHandshake($socket, &$buffer) {
+function wsBuildClientFrame($clientID, &$buffer, $bufferLength) {
+	global $wsClients;
+	
+	// increase number of bytes read for the frame, and join buffer onto end of the frame buffer
+	$wsClients[$clientID][8] += $bufferLength;
+	$wsClients[$clientID][9] .= $buffer;
+	
+	// check if the length of the frame's payload data has been fetched, if not then attempt to fetch it from the frame buffer
+	if ($wsClients[$clientID][7] !== false || wsCheckSizeClientFrame($clientID) == true) {
+		// work out the header length of the frame
+		$headerLength = ($wsClients[$clientID][7] <= 125 ? 0 : ($wsClients[$clientID][7] <= 65535 ? 2 : 8)) + 6;
+		
+		// check if all bytes have been received for the frame
+		$frameLength = $wsClients[$clientID][7] + $headerLength;
+		if ($wsClients[$clientID][8] >= $frameLength) {
+			// check if too many bytes have been read for the frame (they are part of the next frame)
+			$nextFrameBytesLength = $wsClients[$clientID][8] - $frameLength;
+			if ($nextFrameBytesLength > 0) {
+				$wsClients[$clientID][8] -= $nextFrameBytesLength;
+				$nextFrameBytes = substr($wsClients[$clientID][9], $frameLength);
+				$wsClients[$clientID][9] = substr($wsClients[$clientID][9], 0, $frameLength);
+			}
+			
+			// process the frame
+			$result = wsProcessClientFrame($clientID);
+			
+			// check if the client wasn't removed, then reset frame data
+			if (isset($wsClients[$clientID])) {
+				$wsClients[$clientID][7] = false;
+				$wsClients[$clientID][8] = 0;
+				$wsClients[$clientID][9] = '';
+			}
+			
+			// if there's no extra bytes for the next frame, or processing the frame failed, return the result of processing the frame
+			if ($nextFrameBytesLength <= 0 || !$result) return $result;
+			
+			// build the next frame with the extra bytes
+			return wsBuildClientFrame($clientID, $nextFrameBytes, $nextFrameBytesLength);
+		}
+	}
+	
+	return true;
+}
+function wsCheckSizeClientFrame($clientID) {
+	global $wsClients;
+	
+	// check if at least 2 bytes have been stored in the frame buffer
+	if ($wsClients[$clientID][8] > 1) {
+		// fetch payload length in byte 2, max will be 127
+		$payloadLength = ord(substr($wsClients[$clientID][9], 1, 1)) & 127;
+		
+		if ($payloadLength <= 125) {
+			// actual payload length is <= 125
+			$wsClients[$clientID][7] = $payloadLength;
+		}
+		elseif ($payloadLength == 126) {
+			// actual payload length is <= 65,535
+			if (substr($wsClients[$clientID][9], 3, 1) !== false) {
+				// at least another 2 bytes are set
+				$payloadLengthExtended = substr($wsClients[$clientID][9], 2, 2);
+				$array = unpack('na', $payloadLengthExtended);
+				$wsClients[$clientID][7] = $array['a'];
+			}
+		}
+		else {
+			// actual payload length is > 65,535
+			if (substr($wsClients[$clientID][9], 9, 1) !== false) {
+				// at least another 8 bytes are set
+				$payloadLengthExtended = substr($wsClients[$clientID][9], 2, 8);
+				
+				// check if the frame's payload data length exceeds 2,147,483,647 (31 bits)
+				// the maximum integer in PHP is "usually" this number. More info: http://php.net/manual/en/language.types.integer.php
+				$payloadLengthExtended32_1 = substr($payloadLengthExtended, 0, 4);
+				$array = unpack('Na', $payloadLengthExtended32_1);
+				if ($array['a'] != 0 || ord(substr($payloadLengthExtended, 4, 1)) & 128) {
+					wsSendClientClose($clientID, WS_STATUS_MESSAGE_TOO_BIG);
+					return false;
+				}
+				
+				// fetch length as 32 bit unsigned integer, not as 64 bit
+				$payloadLengthExtended32_2 = substr($payloadLengthExtended, 4, 4);
+				$array = unpack('Na', $payloadLengthExtended32_2);
+				
+				// check if the payload data length exceeds 2,147,479,538 (2,147,483,647 - 14 - 4095)
+				// 14 for header size, 4095 for last recv() next frame bytes
+				if ($array['a'] > 2147479538) {
+					wsSendClientClose($clientID, WS_STATUS_MESSAGE_TOO_BIG);
+					return false;
+				}
+				
+				// store frame payload data length
+				$wsClients[$clientID][7] = $array['a'];
+			}
+		}
+		
+		// check if the frame's payload data length has now been stored
+		if ($wsClients[$clientID][7] !== false) {
+			
+			// check if the frame's payload data length exceeds WS_MAX_FRAME_PAYLOAD_RECV
+			if ($wsClients[$clientID][7] > WS_MAX_FRAME_PAYLOAD_RECV) {
+				$wsClients[$clientID][7] = false;
+				wsSendClientClose($clientID, WS_STATUS_MESSAGE_TOO_BIG);
+				return false;
+			}
+			
+			// check if the message's payload data length exceeds 2,147,483,647 or WS_MAX_MESSAGE_PAYLOAD_RECV
+			// doesn't apply for control frames, where the payload data is not internally stored
+			$controlFrame = (ord(substr($wsClients[$clientID][9], 0, 1)) & 8) == 8;
+			if (!$controlFrame) {
+				$newMessagePayloadLength = $wsClients[$clientID][11] + $wsClients[$clientID][7];
+				if ($newMessagePayloadLength > WS_MAX_MESSAGE_PAYLOAD_RECV || $newMessagePayloadLength > 2147483647) {
+					wsSendClientClose($clientID, WS_STATUS_MESSAGE_TOO_BIG);
+					return false;
+				}
+			}
+			
+			return true;
+		}
+	}
+	
+	return false;
+}
+function wsProcessClientFrame($clientID) {
+	global $wsClients;
+	
+	// store the time that data was last received from the client
+	$wsClients[$clientID][3] = time();
+	
+	// fetch frame buffer
+	$buffer = &$wsClients[$clientID][9];
+	
+	// check at least 6 bytes are set (first 2 bytes and 4 bytes for the mask key)
+	if (substr($buffer, 5, 1) === false) return false;
+	
+	// fetch first 2 bytes of header
+	$octet0 = ord(substr($buffer, 0, 1));
+	$octet1 = ord(substr($buffer, 1, 1));
+	
+	$fin = $octet0 & WS_FIN;
+	$opcode = $octet0 & 15;
+	
+	$mask = $octet1 & WS_MASK;
+	if (!$mask) return false; // close socket, as no mask bit was sent from the client
+	
+	// fetch byte position where the mask key starts
+	$seek = $wsClients[$clientID][7] <= 125 ? 2 : ($wsClients[$clientID][7] <= 65535 ? 4 : 10);
+	
+	// read mask key
+	$maskKey = substr($buffer, $seek, 4);
+	
+	$array = unpack('Na', $maskKey);
+	$maskKey = $array['a'];
+	$maskKey = array(
+		$maskKey >> 24,
+		($maskKey >> 16) & 255,
+		($maskKey >> 8) & 255,
+		$maskKey & 255
+	);
+	$seek += 4;
+	
+	// decode payload data
+	if (substr($buffer, $seek, 1) !== false) {
+		$data = str_split(substr($buffer, $seek));
+		foreach ($data as $key => $byte) {
+			$data[$key] = chr(ord($byte) ^ ($maskKey[$key % 4]));
+		}
+		$data = implode('', $data);
+	}
+	else {
+		$data = '';
+	}
+	
+	// check if this is not a continuation frame and if there is already data in the message buffer
+	if ($opcode != WS_OPCODE_CONTINUATION && $wsClients[$clientID][11] > 0) {
+		// clear the message buffer
+		$wsClients[$clientID][11] = 0;
+		$wsClients[$clientID][1] = '';
+	}
+	
+	// check if the frame is marked as the final frame in the message
+	if ($fin == WS_FIN) {
+		// check if this is the first frame in the message
+		if ($opcode != WS_OPCODE_CONTINUATION) {
+			// process the message
+			return wsProcessClientMessage($clientID, $opcode, $data, $wsClients[$clientID][7]);
+		}
+		else {
+			// increase message payload data length
+			$wsClients[$clientID][11] += $wsClients[$clientID][7];
+			
+			// push frame payload data onto message buffer
+			$wsClients[$clientID][1] .= $data;
+			
+			// process the message
+			$result = wsProcessClientMessage($clientID, $wsClients[$clientID][10], $wsClients[$clientID][1], $wsClients[$clientID][11]);
+			
+			// check if the client wasn't removed, then reset message buffer and message opcode
+			if (isset($wsClients[$clientID])) {
+				$wsClients[$clientID][1] = '';
+				$wsClients[$clientID][10] = 0;
+				$wsClients[$clientID][11] = 0;
+			}
+			
+			return $result;
+		}
+	}
+	else {
+		// check if the frame is a control frame, control frames cannot be fragmented
+		if ($opcode & 8) return false;
+		
+		// increase message payload data length
+		$wsClients[$clientID][11] += $wsClients[$clientID][7];
+		
+		// push frame payload data onto message buffer
+		$wsClients[$clientID][1] .= $data;
+		
+		// if this is the first frame in the message, store the opcode
+		if ($opcode != WS_OPCODE_CONTINUATION) {
+			$wsClients[$clientID][10] = $opcode;
+		}
+	}
+	
+	return true;
+}
+function wsProcessClientMessage($clientID, $opcode, &$data, $dataLength) {
+	global $wsClients;
+	
+	// check opcodes
+	if ($opcode == WS_OPCODE_PING) {
+		// received ping message
+		return wsSendClientMessage($clientID, WS_OPCODE_PONG, $data);
+	}
+	elseif ($opcode == WS_OPCODE_PONG) {
+		// received pong message (it's valid if the server did not send a ping request for this pong message)
+		if ($wsClients[$clientID][4] !== false) {
+			$wsClients[$clientID][4] = false;
+		}
+	}
+	elseif ($opcode == WS_OPCODE_CLOSE) {
+		// received close message
+		if (substr($data, 1, 1) !== false) {
+			$array = unpack('na', substr($data, 0, 2));
+			$status = $array['a'];
+		}
+		else {
+			$status = false;
+		}
+		
+		if ($wsClients[$clientID][2] == WS_READY_STATE_CLOSING) {
+			// the server already sent a close frame to the client, this is the client's close frame reply
+			// (no need to send another close frame to the client)
+			$wsClients[$clientID][2] = WS_READY_STATE_CLOSED;
+		}
+		else {
+			// the server has not already sent a close frame to the client, send one now
+			wsSendClientClose($clientID, WS_STATUS_NORMAL_CLOSE);
+		}
+		
+		wsRemoveClient($clientID);
+	}
+	elseif ($opcode == WS_OPCODE_TEXT || $opcode == WS_OPCODE_BINARY) {
+		// received text or binary message
+		if (function_exists('wsOnMessage')) wsOnMessage($clientID, $data, $dataLength, $opcode == WS_OPCODE_BINARY);
+	}
+	else {
+		// unknown opcode
+		return false;
+	}
+	
+	return true;
+}
+function wsProcessClientHandshake($clientID, &$buffer) {
 	// fetch headers and request line
 	$sep = strpos($buffer, "\r\n\r\n");
 	if (!$sep) return false;
@@ -289,7 +635,7 @@ function wsProcessClientHandshake($socket, &$buffer) {
 	if (strlen(base64_decode($key)) != 16) return false;
 	
 	// check Sec-WebSocket-Version header was received and value is 7
-	if (!isset($headersKeyed['Sec-WebSocket-Version']) || (int) $headersKeyed['Sec-WebSocket-Version'] < 7) return false; // should really be != 7, but Firefox 7 beta users have WebSockets 10
+	if (!isset($headersKeyed['Sec-WebSocket-Version']) || (int) $headersKeyed['Sec-WebSocket-Version'] < 7) return false; // should really be != 7, but Firefox 7 beta users send 8
 	
 	// work out hash to use in Sec-WebSocket-Accept reply header
 	$hash = base64_encode(sha1($key.'258EAFA5-E914-47DA-95CA-C5AB0DC85B11', true));
@@ -304,6 +650,9 @@ function wsProcessClientHandshake($socket, &$buffer) {
 	$headers = implode("\r\n", $headers)."\r\n\r\n";
 	
 	// send headers back to client
+	global $wsClients;
+	$socket = $wsClients[$clientID][0];
+	
 	$left = strlen($headers);
 	do {
 		$sent = @socket_send($socket, $headers, $left, 0);
@@ -316,119 +665,15 @@ function wsProcessClientHandshake($socket, &$buffer) {
 	
 	return true;
 }
-function wsProcessClientMessage($clientArrayKey, &$buffer) {
-	global $wsClients;
-	
-	// store the time this socket last received data (not done for sockets that haven't completed the handshake)
-	$wsClients[$clientArrayKey][3] = time();
-	
-	// fetch first 2 bytes of header
-	$octet0 = ord(substr($buffer, 0, 1));
-	$octet1 = ord(substr($buffer, 1, 1));
-	
-	$fin = $octet0 & WS_FIN;
-	$opcode = $octet0 & 15;
-	
-	$mask = $octet1 & WS_MASK;
-	if (!$mask) return false; // close socket, as no mask bit was sent from the client
-	
-	// payload length
-	$payloadLength = $octet1 & 127;
-	if ($payloadLength == WS_PAYLOAD_LENGTH_16) {
-		//$array = unpack('na', substr($buffer, 2, 2));
-		//$payloadLength = $array['a'];
-		$seek = 4;
-	}
-	elseif ($payloadLength == WS_PAYLOAD_LENGTH_63) {
-		if (ord(substr($buffer, 1, 1)) & 128) return false; // most significant bit must be 0
-		//$array0 = unpack('Na', substr($buffer, 2, 4));
-		//$array1 = unpack('Na', substr($buffer, 6, 4));
-		//$payloadLength = ($array0['a'] << 32) | $array1['a'];
-		$seek = 10;
-	}
-	else {
-		$seek = 2;
-	}
-	
-	// read mask key
-	$array = unpack('Na', substr($buffer, $seek, 4));
-	$maskKey = $array['a'];
-	$maskKey = array(
-		$maskKey >> 24,
-		($maskKey >> 16) & 255,
-		($maskKey >> 8) & 255,
-		$maskKey & 255
-	);
-	$seek += 4;
-	
-	// decode data
-	$data = str_split(substr($buffer, $seek));
-	foreach ($data as $key => $byte) {
-		$data[$key] = chr(ord($byte) ^ ($maskKey[$key % 4]));
-	}
-	$data = implode('', $data);
-	
-	// check if frame is a control frame and fin is not set, which is invalid, as control frames cannot be fragmented
-	if ($opcode & 8 && $fin != WS_FIN) {
-		return false;
-	}
-	
-	// check opcodes
-	if ($opcode == WS_OPCODE_PING) {
-		// received ping request
-		return wsSendClientMessage($wsClients[$clientArrayKey][0], WS_OPCODE_PONG, $data);
-	}
-	elseif ($opcode == WS_OPCODE_PONG) {
-		// received pong reply (it's valid that the server did not send a ping request for this pong reply)
-		if ($wsClients[$clientArrayKey][4] !== false) {
-			$wsClients[$clientArrayKey][4] = false;
-		}
-		return true;
-	}
-	elseif ($opcode == WS_OPCODE_CLOSE) {
-		// received close request
-		if (substr($data, 1, 1) !== false) {
-			$array = unpack('na', substr($data, 0, 2));
-			$status = $array['a'];
-		}
-		else {
-			$status = false;
-		}
-		
-		if ($wsClients[$clientArrayKey][2] == WS_READY_STATE_CLOSING) {
-			// the server already sent a close frame to the client, this is the client's close frame reply
-			// (no need to send another close frame to the client)
-			$wsClients[$clientArrayKey][2] = WS_READY_STATE_CLOSED;
-		}
-		else {
-			// the server has not already sent a close frame to the client, send one now
-			wsSendClientClose($wsClients[$clientArrayKey][0], WS_STATUS_NORMAL_CLOSE);
-		}
-		
-		wsRemoveClient($wsClients[$clientArrayKey][0]);
-	}
-	elseif ($opcode == WS_OPCODE_CONTINUATION || $opcode == WS_OPCODE_TEXT || $opcode == WS_OPCODE_BINARY) {
-		// received continuation, text or binary frame
-		if ($fin == WS_FIN) { // final frame of message
-			if ($opcode != 0) { // first frame of message (non continuation frame), no need to move data into buffer in $wsClients
-				if (function_exists('wsOnMessage')) wsOnMessage($wsClients[$clientArrayKey][0], $data, $opcode == 2);
-			}
-			else {
-				$wsClients[$clientArrayKey][1] .= $data;
-				if (function_exists('wsOnMessage')) wsOnMessage($wsClients[$clientArrayKey][0], $wsClients[$clientArrayKey][1], $opcode == 2);
-				$wsClients[$clientArrayKey][1] = '';
-			}
-		}
-		else { // more frame(s) of message to come
-			$wsClients[$clientArrayKey][1] .= $data;
-		}
-	}
-	
-	return true;
-}
 
 // client write functions
-function wsSendClientMessage($socket, $opcode, $message) {
+function wsSendClientMessage($clientID, $opcode, $message) {
+	global $wsClients;
+	
+	// check if client ready state is already closing or closed
+	if ($wsClients[$clientID][2] == WS_READY_STATE_CLOSING || $wsClients[$clientID][2] == WS_READY_STATE_CLOSED) return true;
+	
+	// fetch message length
 	$messageLength = strlen($message);
 	
 	// set max payload length per frame
@@ -471,6 +716,8 @@ function wsSendClientMessage($socket, $opcode, $message) {
 		$buffer = pack('n', (($fin | $opcode) << 8) | $payloadLength) . $payloadLengthExtended . substr($message, $i*$bufferSize, $bufferLength);
 		
 		// send frame
+		$socket = $wsClients[$clientID][0];
+		
 		$left = 2 + $payloadLengthExtendedLength + $bufferLength;
 		do {
 			$sent = @socket_send($socket, $buffer, $left, 0);
@@ -484,27 +731,29 @@ function wsSendClientMessage($socket, $opcode, $message) {
 	
 	return true;
 }
-function wsSendClientClose($socket, $status=false) {
+function wsSendClientClose($clientID, $status=false) {
 	global $wsClients;
 	
-	$key = wsGetClientArrayKey($socket);
-	if ($wsClients[$key][2] == WS_READY_STATE_CLOSING) return true;
-	$wsClients[$key][2] = WS_READY_STATE_CLOSING;
-	$wsClients[$key][5] = $status;
+	// check if client ready state is already closing or closed
+	if ($wsClients[$clientID][2] == WS_READY_STATE_CLOSING || $wsClients[$clientID][2] == WS_READY_STATE_CLOSED) return true;
 	
+	// store close status
+	$wsClients[$clientID][5] = $status;
+	
+	// send close frame to client
 	$status = $status !== false ? pack('n', $status) : '';
-	wsSendClientMessage($socket, WS_OPCODE_CLOSE, $status);
+	wsSendClientMessage($clientID, WS_OPCODE_CLOSE, $status);
+	
+	// set client ready state to closing
+	$wsClients[$clientID][2] = WS_READY_STATE_CLOSING;
 }
 
 // client non-internal functions
-function wsClose($socket) {
-	global $wsClients;
-	
-	$key = wsGetClientArrayKey($socket);
-	return wsSendClientClose($socket, WS_STATUS_NORMAL_CLOSE);
+function wsClose($clientID) {
+	return wsSendClientClose($clientID, WS_STATUS_NORMAL_CLOSE);
 }
-function wsSend($socket, $message, $binary=false) {
-	return wsSendClientMessage($socket, $binary ? WS_OPCODE_BINARY : WS_OPCODE_TEXT, $message);
+function wsSend($clientID, $message, $binary=false) {
+	return wsSendClientMessage($clientID, $binary ? WS_OPCODE_BINARY : WS_OPCODE_TEXT, $message);
 }
 
 ?>
