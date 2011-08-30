@@ -1,27 +1,21 @@
 <?php
 
 /*
-	[ Chatbox Getting Started ]
+	Example Chatbox Script
+	 - Uses WebSocket for client and server communication
+	 - Works with: ws api.php
 	
-	This is an example chat box script, which works with file 'ws api.php'
+	Starting the server
+	 - Open any browser and visit server.php once (this file). For example: http://127.0.0.1/chatbox/server.php
+	   The page should appear to "never load", this is supposed to happen and means the server is running.
 	
-	Make sure you are using an internet browser which works with WebSockets version 07.
-	As of writing this, 24/08/2011, the only browser supporting WebSockets 07 is Firefox 6.
+	Connecting to the chatbox
+	 - Open Firefox 6 and visit index.html. For example: http://127.0.0.1/chatbox/
+	 - Type a username into the top right box, and press the connect button.
+	   You should now be able to send messages, receive messages, and see a list of connected users.
 	
-	Stage 1 - Start the server
-		Open your browser, and go to server.php (this file). For example: http://127.0.0.1/chatbox/server.php
-		The page will appear to never load, this is supposed to happen and means the server is running.
-	
-	Stage 2 - Using the chatbox
-		Open a new tab in your browser, and go to index.html. For example: http://127.0.0.1/chatbox/index.html
-		Type a username into the top right box, press the connect button.
-		You should now be able to send messages, receive messages, and see a list of users connected.
-	
-	
-	[ Chatbox Protocol ]
-	
-	This chatbox script uses a very basic text protocol, described here.
-	This protocol has nothing to do with the WebSockets extensions stuff.
+	Protocol
+	 - This example chatbox script uses a very basic text protocol.
 	
 	Client -> Server:
 		JOIN username
@@ -37,14 +31,20 @@
 	
 	USERS sends a list of space-separated usernames to a client when that client has joined.
 	SERVER sends text to a client that is not chat text, for example: Username already taken
-	QUIT does not take a username because the server stores all usernames.
-	The other ones should be pretty obvious really.
+	QUIT does not need to take a username because the server stores usernames for clients in $users.
 */
 
 // settings
-define('CB_SERVER_BIND_HOST',    gethostbyaddr(gethostbyname($_SERVER['SERVER_NAME'])) ); // if this fails, try LAN IP, 127.0.0.1, or external IP
-define('CB_SERVER_BIND_PORT',    9432); // also change at top of main.js
-define('CB_MAX_USERNAME_LENGTH', 18);   // also change at top of main.js
+
+// for other computers to connect, you will probably need to change this to your LAN IP or external IP,
+// alternatively use: gethostbyaddr(gethostbyname($_SERVER['SERVER_NAME']))
+define('CB_SERVER_BIND_HOST', '127.0.0.1');
+
+// also change at top of main.js
+define('CB_SERVER_BIND_PORT', 9300);
+
+// also change at top of main.js
+define('CB_MAX_USERNAME_LENGTH', 18);
 
 
 
@@ -52,25 +52,23 @@ define('CB_MAX_USERNAME_LENGTH', 18);   // also change at top of main.js
 // prevent the server from timing out
 set_time_limit(0);
 
-// include the web sockets server script
+// include the web sockets server script (the server is started at the far bottom of this file)
 require '../ws api.php';
 
 
 
 
-// users are stored in a 2 dimensional array
+// users are stored in this global array with syntax: $users[ integer ClientID ] = string Username
 $users = array();
-/*
-	Syntax:
-	
-	$users[ i ] = array(
-		0 => resource Socket,
-		1 => string   Username
-	)
-*/
 
 // when a client sends data to the server
-function wsOnMessage($socket, $message, $binary) {
+function wsOnMessage($clientID, $message, $messageLength, $binary) {
+	// check if message length is 0
+	if ($messageLength == 0) {
+		wsClose($clientID);
+		return;
+	}
+	
 	// split the message by spaces into an array, and fetch the command
 	$message = explode(' ', $message);
 	$command = array_shift($message);
@@ -79,9 +77,9 @@ function wsOnMessage($socket, $message, $binary) {
 	if ($command == 'TEXT') {
 		// a client has sent chat text to the server
 		
-		if (!isUser($socket)) {
-			// the client has not yet sent a JOIN, and is trying to send a TEXT
-			wsClose($socket);
+		if (!isUser($clientID)) {
+			// the client has not yet sent a JOIN with a valid username, and is trying to send a TEXT
+			wsClose($clientID);
 			return;
 		}
 		
@@ -90,21 +88,21 @@ function wsOnMessage($socket, $message, $binary) {
 		
 		if ($text == '') {
 			// the text is blank
-			wsSend($socket, 'SERVER Message was blank.');
+			wsSend($clientID, 'SERVER Message was blank.');
 			return;
 		}
 		
 		// fetch the client's username, and send the chat text to all clients
 		// the text is actually also sent back to the client which sent the text, which sort of acts as a confirmation that the text worked
-		$username = getUsername($socket);
+		$username = getUsername($clientID);
 		sendChat($username, $text);
 	}
 	elseif ($command == 'JOIN') {
 		// a client is joining the chat
 		
-		if (isUser($socket)) {
-			// the client has already sent a JOIN
-			wsClose($socket);
+		if (isUser($clientID)) {
+			// the client has already sent a JOIN with a valid username
+			wsClose($clientID);
 			return;
 		}
 		
@@ -113,127 +111,110 @@ function wsOnMessage($socket, $message, $binary) {
 		
 		if ($username == '') {
 			// the username is blank
-			wsClose($socket);
+			wsClose($clientID);
 			return;
 		}
 		if (strlen($username) > CB_MAX_USERNAME_LENGTH) {
 			// username length is more than CB_MAX_USERNAME_LENGTH
-			wsSend($socket, 'SERVER Username length cannot be more than '.CB_MAX_USERNAME_LENGTH.'.');
-			wsClose($socket);
+			wsSend($clientID, 'SERVER Username length cannot be more than '.CB_MAX_USERNAME_LENGTH.'.');
+			wsClose($clientID);
 			return;
 		}
 		if (isUsername($username)) {
 			// username is already being used by another client
-			wsSend($socket, 'SERVER Username already taken.');
-			wsClose($socket);
+			wsSend($clientID, 'SERVER Username already taken.');
+			wsClose($clientID);
 			return;
 		}
 		
-		// store the client's socket variable and username into an array,
-		// let all clients know about this client joining (not including the client joining),
-		// and send a list of usernames to the client which is joining
-		addUser($socket, $username);
+		// add the user
+		addUser($clientID, $username);
 	}
 	elseif ($command == 'QUIT') {
 		// a client is leaving the chat
 		
-		if (!isUser($socket)) {
-			// the client has not yet sent a JOIN, and is trying to send a QUIT
-			wsClose($socket);
+		if (!isUser($clientID)) {
+			// the client has not yet sent a JOIN with a valid username, and is trying to send a QUIT
+			wsClose($clientID);
 			return;
 		}
 		
-		// let all clients know about this client quitting, (not including the client quitting)
-		// and remove the client's socket variable and username from the array
-		removeUser($socket);
+		// remove the user
+		removeUser($clientID);
 	}
 	else {
 		// unknown command received, close connection
-		wsClose($socket);
+		wsClose($clientID);
 	}
 }
 
 // when a client closes or lost connection
-function wsOnClose($socket, $status) {
-	// check if the client has successfully sent a JOIN
-	if (isUser($socket)) {
-		removeUser($socket);
+function wsOnClose($clientID, $status) {
+	// check if the client has sent a JOIN with a valid username
+	if (isUser($clientID)) {
+		removeUser($clientID);
 	}
 }
 
 // user functions
-function isUser($socket) {
-	// checks if a user exists (if JOIN has been received from the client)
+function isUser($clientID) {
+	// checks if a user exists (if JOIN has previously been received from the client, with a valid username)
 	global $users;
-	foreach ($users as $user) {
-		if ($user[0] == $socket) return true;
-	}
-	return false;
+	return isset($users[$clientID]);
 }
-function addUser($socket, $username) {
-	// adds a user
+function addUser($clientID, $username) {
 	global $users;
-	$users[] = array($socket, $username);
 	
-	foreach ($users as $user) {
-		if ($user[0] != $socket) {
-			wsSend($user[0], 'ONJOIN '.$username);
-		}
+	// let all clients know about this user joining (not including the user joining)
+	foreach ($users as $clientID2 => $username2) {
+		wsSend($clientID2, 'ONJOIN '.$username);
 	}
 	
-	$usernames = getUsernames($socket);
-	wsSend($socket, 'USERS '.implode(' ', $usernames));
+	// send list of usernames to the user joining
+	$usernames = getUsernames();
+	wsSend($clientID, 'USERS '.implode(' ', $usernames));
+	
+	// store the user's client ID and username
+	$users[$clientID] = $username;
 }
-function removeUser($socket) {
-	// removes a user
+function removeUser($clientID) {
 	global $users;
 	
-	$username = getUsername($socket);
+	// fetch username for the user leaving
+	$username = getUsername($clientID);
 	
-	foreach ($users as $user) {
-		if ($user[0] != $socket) {
-			wsSend($user[0], 'ONQUIT '.$username);
-		}
-	}
+	// remove data stored for the user leaving
+	unset($users[$clientID]);
 	
-	array_splice($users, getUserArrayKey($socket), 1);
-}
-function getUserArrayKey($socket) {
-	// gets the array key in $users for the client
-	global $users;
-	foreach ($users as $key => $user) {
-		if ($user[0] == $socket) return $key;
+	// let all clients know about this user quitting (not including the user leaving)
+	foreach ($users as $clientID2 => $username2) {
+		wsSend($clientID2, 'ONQUIT '.$username);
 	}
-	return false;
 }
 
 // username functions
+function getUsername($clientID) {
+	// returns the username for a client
+	global $users;
+	return $users[$clientID];
+}
 function isUsername($username) {
-	// checks if a username is being used by any client
+	// checks if the username is being used by any client
 	global $users;
-	foreach ($users as $user) {
-		if ($user[1] == $username) return true;
+	foreach ($users as $username2) {
+		if ($username === $username2) return true;
 	}
 	return false;
 }
-function getUsername($socket) {
-	// fetches the username from a client's socket variable
+function getUsernames() {
+	// returns an array of usernames
 	global $users;
-	foreach ($users as $user) {
-		if ($user[0] == $socket) return $user[1];
-	}
-	return false;
-}
-function getUsernames($socket=false) {
-	// fetches a list of usernames as an array,
-	// optionally, not including the username for the client's socket variable sent to the function
-	global $users;
+	
 	$usernames = array();
-	foreach ($users as $user) {
-		if ($socket == false || $user[0] != $socket) {
-			$usernames[] = $user[1];
-		}
+	foreach ($users as $username) {
+		$usernames[] = $username;
 	}
+	
 	return $usernames;
 }
 
@@ -241,8 +222,8 @@ function getUsernames($socket=false) {
 function sendChat($username, $text) {
 	// sends chat text to all clients
 	global $users;
-	foreach ($users as $user) {
-		wsSend($user[0], 'ONTEXT '.$username.' '.$text);
+	foreach ($users as $clientID => $user) {
+		wsSend($clientID, 'ONTEXT '.$username.' '.$text);
 	}
 }
 
