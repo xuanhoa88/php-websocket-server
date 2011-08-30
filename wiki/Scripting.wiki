@@ -1,17 +1,18 @@
-=PHP Functions & Callbacks=
+=PHP WebSocket Server 0.2 - Scripting & Settings=
 
 ==Functions==
 
 wsStartServer(string Host, integer Port)<br>
 wsStopServer()<br>
-wsSend(resource Socket, string Message, `[` boolean Binary = false `]`)<br>
-wsClose(resource Socket)
+wsSend(integer ClientID, string Message, `[` boolean Binary = false `]`)<br>
+wsClose(integer ClientID)<br>
+wsGetClientSocket(integer ClientID)
 
 ==Callbacks==
 
-wsOnOpen(resource Socket)<br>
-wsOnMessage(resource Socket, string Message, boolean Binary)<br>
-wsOnClose(resource Socket, integer/false Status)
+wsOnOpen(integer ClientID)<br>
+wsOnMessage(integer ClientID, string Message, integer MessageLength, boolean Binary)<br>
+wsOnClose(integer ClientID, integer/false Status)
 
 ==Function Details==
 
@@ -22,45 +23,68 @@ This is the core function that runs the server, this function does not return un
 
 *wsStopServer()*
 
-This stops the server, and informs all clients that the server is shutting down.  This will cause *wsStartServer* to return true.
+This stops the server, and informs all clients that the server is shutting down.<br>
+This function will cause *wsStartServer* to return true.
 
-*wsSend(resource Socket, string Message, `[` boolean Binary = false `]`)*
+*wsSend(integer ClientID, string Message, `[` boolean Binary = false `]`)*
 
-This sends a message to a client. If the optional _Binary_ parameter is true, the message type is set to binary.
+This sends a message to a client.<br>
+If the optional _Binary_ parameter is true, the message type is set to binary.
 
-*wsClose(resource Socket)*
+*wsClose(integer ClientID)*
 
 This starts the closing handshake with a client, the connection will be closed when either:
   * the client responds with a close frame
   * the client closes the TCP connection
-  * the connection times out on the server
+  * the connection times out on the server (see setting WS_TIMEOUT_RECV)
+
+*wsGetClientSocket(integer ClientID)*
+
+This returns the socket resource for a client.
 
 ==Callback Details==
 
-*wsOnOpen(resource Socket)*
+*wsOnOpen(integer ClientID)*
 
 This is called when the opening handshake for a client is completed.
 
-*wsOnMessage(resource Socket, string Message, boolean Binary)*
+*wsOnMessage(integer ClientID, string Message, integer MessageLength, boolean Binary)*
 
-This is called when the server receives a message from a client. The _Binary_ parameter indicates whether the message type is binary or text.
+This is called when the server receives a message from a client.<br>
+The _Binary_ parameter indicates whether the message type is binary or text.
 
-*wsOnClose(resource Socket, integer/false Status)*
+*wsOnClose(integer ClientID, integer/false Status)*
 
-This is called when the server closes a client connection. The _Status_ parameter will be false if the client triggered the close and did not specify a status code.
+This is called when the server closes a client connection.<br>
+The _Status_ parameter will be false if the client triggered the close and did not specify a status code.
 
-=Settings=
+==Settings==
 
-At the top of *ws api.php*, there are a few settings which can be changed.
+At the top of *ws api.php*, 6 settings can optionally be changed.
 
 *WS_MAX_CLIENTS*
 
-This is the maximum amount of clients the server will accept.
+This is the maximum amount of clients that can be connected to the server at one time.
 
-*WS_IDLE_LIMIT_READ*
+*WS_MAX_CLIENTS_PER_IP*
 
-This is the amount of seconds a client has to send any data to the server, before the server sends the client a ping request.
+This is the maximum amount of clients that can be connected to the server at one time on the same IP v4 address.
 
-*WS_IDLE_LIMIT_PONG*
+*WS_TIMEOUT_RECV*
 
-This works with _WS_IDLE_LIMIT_READ_, and is the amount of seconds a client has to respond to the ping request before the server closes the client connection.
+This is the amount of seconds a client has to send any data to the server, before the server sends the client a ping request.<br>
+If the client has not completed the opening handshake, the ping request is skipped and the client connection is closed.
+
+*WS_TIMEOUT_PONG*
+
+This works with _WS_TIMEOUT_RECV_, and is the amount of seconds a client has to respond to the ping request before the server closes the client connection.
+
+*WS_MAX_FRAME_PAYLOAD_RECV*
+
+This is the maximum length, in bytes, of a frame's payload data. (a _message_ consists of 1 or more frames)<br>
+This is also internally limited to 2,147,479,538.
+
+*WS_MAX_MESSAGE_PAYLOAD_RECV*
+
+This is the maximum length, in bytes, of a message's payload data.<br>
+This is also internally limited to 2,147,483,647.
